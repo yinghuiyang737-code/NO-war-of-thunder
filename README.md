@@ -67,15 +67,5 @@
 
 未联网、仓库尚未发布正式版本或更新失败时，现有游戏仍可运行。源码自检不会联网检查更新。
 
-## 开发与验证
-
-入口源码为 `outputs/SteelWilderness.py`，依赖 Python 3.12、pygame-ce；Windows 打包使用 PyInstaller。各功能模块位于 `outputs/`，项目内部的 `work/packages` 保存本地构建依赖。
-
-在依赖已配置的环境中运行：
-
-```powershell
-python outputs/SteelWilderness.py --test
-python -m PyInstaller --noconfirm --onefile --windowed --name SteelWilderness --distpath work/release --workpath work/build --specpath work outputs/SteelWilderness.py
-```
 
 先验证内部打包文件，再替换 `outputs/SteelWilderness.exe`。自检不导出预览图片，更新交付时保留玩家进度与按键设置，清理旧 EXE 和临时构建文件。
