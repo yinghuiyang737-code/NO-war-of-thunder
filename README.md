@@ -67,15 +67,6 @@
 
 未联网、仓库尚未发布正式版本或更新失败时，现有游戏仍可运行。源码自检不会联网检查更新。
 
-### 发布新版本
-
-1. 修改游戏后，提高 `outputs/AutoUpdate.py` 中的 `VERSION`，例如 `2026.10.12.1`。采用三个或四个数字组成的递增版本号。
-2. 打包并验证 `SteelWilderness.exe`。
-3. 在本仓库创建正式 Release，标签使用对应的 `v2026.10.12.1`；将该 Release 标为最新版本。
-4. 上传附件 **SteelWilderness.exe**。不要将更新包改名；更新器使用 GitHub 为附件生成的 SHA-256 摘要。
-
-更新器忽略草稿、预发布、同版本与较低版本，不使用仓库源码 ZIP 作为更新包。首次发布当前版本可以使用标签 `v2026.10.11.3`；后续版本需要更高的数字版本号。
-
 ## 开发与验证
 
 入口源码为 `outputs/SteelWilderness.py`，依赖 Python 3.12、pygame-ce；Windows 打包使用 PyInstaller。各功能模块位于 `outputs/`，项目内部的 `work/packages` 保存本地构建依赖。
