@@ -2,6 +2,57 @@ import os, sys, math, random, heapq
 if '--apply-update' in sys.argv:
     from AutoUpdate import run_update_helper
     raise SystemExit(run_update_helper())
+if '--air-bank-check' in sys.argv:
+    import time,ctypes
+    import WTBank
+    WTBank.installations=lambda:[]
+    for language in ('zh','en','jp'):
+        bank=WTBank.BankPlayer();bank.language=language
+        bank.import_pack(sys.argv[sys.argv.index('--air-bank-check')+1])
+        assert not bank.load_errors,bank.load_errors
+        assert language in bank.languages
+        assert os.path.basename(bank.catalog['aircraft_gui.bank']).lower().startswith({'zh':'chinese','en':'english','jp':'japanese'}[language])
+        for family in ('betty','rita','xiao906'):
+            bank.voice_family=family
+            assert bank.play('voice_missile_warning',0)
+            for _ in range(8):bank.update();time.sleep(.025)
+            state=ctypes.c_int()
+            bank.call('EventInstance_GetPlaybackState',[WTBank.P,ctypes.POINTER(ctypes.c_int)],bank.instance,ctypes.byref(state))
+            assert state.value==0,(language,family,state.value)
+            assert not bank.last_error,bank.last_error
+        for key in ('radar_scan','rwr_search','rwr_lock','radar_lock'):
+            bank.play('voice_missile_warning',0);voice=bank.instance.value
+            assert bank.play_effect(key,0)
+            assert bank.instance.value==voice
+            for _ in range(8):bank.update();time.sleep(.025)
+            state=ctypes.c_int()
+            bank.call('EventInstance_GetPlaybackState',[WTBank.P,ctypes.POINTER(ctypes.c_int)],bank.effect_instance,ctypes.byref(state))
+            assert state.value==0,(language,key,state.value)
+            assert os.path.normcase(os.path.abspath(bank.catalog['aircraft_gui.assets.bank'])) in bank.loaded_paths
+        bank.stop_effect();assert bank.effect_instance is None
+        from BankAudioChecks import check_output
+        check_output(bank)
+        bank.close()
+    raise SystemExit(0)
+if '--bank-check' in sys.argv:
+    import time
+    import WTBank
+    WTBank.installations=lambda:[]
+    bank=WTBank.BankPlayer();bank.language='ru'
+    assert getattr(sys,'_MEIPASS','') in bank.runtime
+    bank.import_pack(sys.argv[sys.argv.index('--bank-check')+1])
+    assert not bank.load_errors and not bank.can_alarm
+    bank.set_alarm(True,0);assert not bank.alarm_instance
+    path=next(p for p in bank.events if p.endswith('voice_message_commander_battle_start') and '/med/' in p)
+    assert bank.play_path(path,0)
+    for _ in range(40):bank.update();time.sleep(.05)
+    assert bank.resolved_samples and not bank.last_error
+    for key in ('ground_reload_start','ground_load_sabot','ground_ready_sabot'):
+        assert bank.play(key,0)
+        for _ in range(20):bank.update();time.sleep(.05)
+        assert not bank.last_error
+    assert any('load_sabot' in key for key in bank.resolved_samples)
+    bank.close();raise SystemExit(0)
 TEST='--test' in sys.argv
 if TEST or '--exit-check' in sys.argv:
     os.environ['SDL_VIDEODRIVER']='dummy'
@@ -64,7 +115,8 @@ MECHANICAL=('left_track','right_track','engine','transmission','ring','breech','
 def module_color(n):return (105,201,155) if n==2 else (242,182,67) if n==1 else (218,69,54)
 class Terrain:
     def __init__(self,map_id='wilderness'):
-        layout=MAPS[map_id]
+        self.map_id=map_id
+        layout=MAPS[map_id];self.seed=layout['seed']
         rng=random.Random(layout['seed']);self.obstacles=[];self.trees=[];self.grass=[];self.fallen=[];self.tree_events=[]
         self.ponds=[pygame.Rect(*r) for r in [(620,600,400,230),(2390,1640,400,270),(530,2100,330,200),(3820,830,520,310),(4510,2680,550,350),(2030,3590,430,280),(3580,3860,480,290)]]
         self.ponds.extend([pygame.Rect(6500,1250,550,340),pygame.Rect(7200,4600,630,400),pygame.Rect(2200,5700,500,330)])
@@ -135,6 +187,22 @@ class Terrain:
         return result
     def segment_obstacles(self,a,b):
         return self.nearby_obstacles(pygame.FRect(min(a[0],b[0]),min(a[1],b[1]),max(1,abs(a[0]-b[0])),max(1,abs(a[1]-b[1]))))
+    def remove_obstacle(self,r,kind):
+        indexed=getattr(self,'obstacle_signature',None)==(id(self.obstacles),len(self.obstacles))
+        self.obstacles.remove((r,kind))
+        if indexed:
+            for x in range(math.floor(r.left/256),math.floor(r.right/256)+1):
+                for y in range(math.floor(r.top/256),math.floor(r.bottom/256)+1):
+                    key=(x,y);items=self.obstacle_chunks.get(key,[])
+                    self.obstacle_chunks[key]=[item for item in items if item[0] is not r]
+            self.obstacle_signature=(id(self.obstacles),len(self.obstacles))
+    def remove_tree(self,tree):
+        indexed=getattr(self,'tree_signature',None)==(id(self.trees),len(self.trees))
+        self.trees.remove(tree)
+        if indexed:
+            key=(math.floor(tree[0].x/512),math.floor(tree[0].y/512))
+            self.tree_chunks[key]=[item for item in self.tree_chunks.get(key,[]) if item is not tree]
+            self.tree_signature=(id(self.trees),len(self.trees))
     def free(self,p,radius=34,trees=True):
         r=pygame.Rect(0,0,radius*2,radius*2);r.center=p
         return pygame.Rect(20,20,MW-40,MH-40).contains(r) and not any(r.colliderect(o) for o,k in self.nearby_obstacles(r) if trees or k!='tree')
@@ -147,10 +215,10 @@ class Terrain:
                 if not any(polygons_overlap(shape,rect_polygon(r)) for shape in footprint):continue
             local=(V(r.center)-p).rotate(-a)
             if footprint is None and not (abs(local.x)<31 and abs(local.y)<27) and not any(r.clipline(poly[i],poly[(i+1)%4]) for i in range(4)):continue
-            self.obstacles.remove((r,k))
+            self.remove_obstacle(r,k)
             for tree in self.trees[:]:
                 if tree[0].distance_to(V(r.center))<2:
-                    self.trees.remove(tree);self.fallen.append([V(tree[0]),tree[1],a+(180 if speed<0 else 0),0.]);self.tree_events.append(V(tree[0]));break
+                    self.remove_tree(tree);self.fallen.append([V(tree[0]),tree[1],a+(180 if speed<0 else 0),0.]);self.tree_events.append(V(tree[0]));break
     def strike_tree(self,a,b,energy=1):
         contacts=[]
         for rect,kind in self.segment_obstacles(a,b):
@@ -163,11 +231,11 @@ class Terrain:
         if not hasattr(self,'tree_damage'):self.tree_damage={}
         key=tuple(rect.center);self.tree_damage[key]=self.tree_damage.get(key,0)+energy
         if self.tree_damage[key]>=4:
-            self.obstacles.remove((rect,kind));self.tree_damage.pop(key,None)
+            self.remove_obstacle(rect,kind);self.tree_damage.pop(key,None)
             for tree in self.trees[:]:
                 if tree[0].distance_to(V(rect.center))<2:
                     delta=V(b)-V(a);angle=math.degrees(math.atan2(delta.y,delta.x))
-                    self.trees.remove(tree);self.fallen.append([V(tree[0]),tree[1],angle,0.]);self.tree_events.append(V(tree[0]));break
+                    self.remove_tree(tree);self.fallen.append([V(tree[0]),tree[1],angle,0.]);self.tree_events.append(V(tree[0]));break
         return point
     def blast_trees(self,p,radius):
         for tree in self.trees[:]:
@@ -179,15 +247,17 @@ class Terrain:
     def blocks_shell(self,a,b):return any(k!='deep_water' and r.clipline(a,b) for r,k in self.segment_obstacles(a,b))
     def draw(self,g):
         screen.fill((69,83,48));cam=g.cam
+        from Seasons import ground,season,tree
+        ground(g,screen,g.render_view,g.to_screen)
         def rect(r):return r.move(-cam.x,-cam.y)
-        for road in self.roads:pygame.draw.rect(screen,(115,102,67),rect(road))
+        for road in self.roads:pygame.draw.rect(screen,(151,163,170) if season(g)=='winter' else (115,102,67),rect(road))
         if self.city_regions:
             from UrbanMap import draw_ground
             draw_ground(self,screen,cam,g.render_view)
         nearby_grass=(item for x in range(int(cam.x)//512,int(cam.x+g.render_view.right)//512+1) for y in range(int(cam.y+g.render_view.top)//512,int(cam.y+g.render_view.bottom)//512+1) for item in self.grass_chunks.get((x,y),()))
         for p,c in nearby_grass:
             q=g.to_screen(p)
-            if g.render_view.collidepoint(q):pygame.draw.line(screen,[(83,101,56),(57,72,42),(105,110,61)][c],q,q+V(2,-4),1)
+            if g.render_view.collidepoint(q):pygame.draw.line(screen,((191,209,215) if season(g)=='winter' else [(151,130,64),(118,103,54),(172,143,74)][c] if season(g)=='autumn' else [(83,101,56),(57,72,42),(105,110,61)][c]),q,q+V(2,-4),1)
         for p in self.ponds:
             rr=rect(p)
             if not rr.colliderect(g.render_view):continue
@@ -200,7 +270,8 @@ class Terrain:
                 for x in range(rr.left+18,rr.right-20,55):
                     col=(78,120,133) if deep.collidepoint(x,y) else (137,186,173)
                     pygame.draw.line(screen,col,(x,y),(x+16,y),1)
-        for r,k in self.obstacles:
+        bounds=pygame.FRect(cam.x+g.render_view.left-20,cam.y+g.render_view.top-20,g.render_view.w+40,g.render_view.h+40)
+        for r,k in self.nearby_obstacles(bounds):
             rr=rect(r)
             if not rr.colliderect(g.render_view) or k in ('tree','deep_water'):continue
             if k=='house':
@@ -210,7 +281,7 @@ class Terrain:
                 pygame.draw.line(screen,(80,66,48),(rr.centerx,rr.top),(rr.centerx,rr.bottom),4)
                 for y in range(rr.top+12,rr.bottom,20):pygame.draw.line(screen,(98,79,56),(rr.left+3,y),(rr.right-3,y),1)
                 if self.city_regions:
-                    pygame.draw.rect(screen,(130,136,137),rr,border_radius=2)
+                    pygame.draw.rect(screen,(228,237,240),rr,border_radius=2)
                     pygame.draw.rect(screen,(190,193,179),rr,4)
                     pygame.draw.rect(screen,(86,94,96),(rr.x+15,rr.y+15,24,19))
                     pygame.draw.rect(screen,(158,163,156),rr.inflate(-22,-30),2)
@@ -228,9 +299,10 @@ class Terrain:
             for offset in (-8,8):
                 branch=tip+direction(a+90)*offset
                 pygame.draw.line(screen,(99,76,43),q.lerp(tip,.65),branch,3)
-                pygame.draw.circle(screen,(61,85,42),branch,max(5,int(r*(1-.45*progress))))
+                pygame.draw.circle(screen,tree(g,p,1),branch,max(5,int(r*(1-.45*progress))))
             pygame.draw.circle(screen,(155,119,67),q,5)
     def canopy(self,g):
+        from Seasons import tree as seasonal_tree
         signature=(id(self.trees),len(self.trees))
         if getattr(self,'tree_signature',None)!=signature:
             self.tree_signature=signature;self.tree_chunks={}
@@ -241,9 +313,9 @@ class Terrain:
             q=g.to_screen(p)
             if not g.render_view.inflate(90,90).collidepoint(q):continue
             pygame.draw.circle(screen,(41,51,31),q+V(8,9),r)
-            pygame.draw.circle(screen,(43,70,40),q,r)
-            pygame.draw.circle(screen,(60,91,46),q+V(-6,-6),int(r*.73))
-            pygame.draw.circle(screen,(76,106,53),q+V(-9,-9),int(r*.38))
+            pygame.draw.circle(screen,seasonal_tree(g,p,0),q,r)
+            pygame.draw.circle(screen,seasonal_tree(g,p,1),q+V(-6,-6),int(r*.73))
+            pygame.draw.circle(screen,seasonal_tree(g,p,2),q+V(-9,-9),int(r*.38))
 class Tank:
     def __init__(self,p,enemy=False,elite=False,vehicle=None):
         self.mg_cd=0.;self.belt_cursor=0;self.missile_cd=0.;self.smoke_cd=0.;self.ess_active=False;self.ess_timer=0.;self.smoke_charges=3 if vehicle and VEHICLES[vehicle]['smoke_grenades'] else 0;self.missile_index=next((i for i,a in enumerate(VEHICLES[vehicle]['ammo_options']) if guided(a)),0) if vehicle else 0;self.vehicle_id=vehicle;self.ammo_index=default_ammo(VEHICLES[vehicle]) if vehicle else 0
@@ -366,7 +438,8 @@ class Tank:
         if self.modules['ring'] and self.modules['gunner']:
             rate=self.stats.get('aim_response_slew',self.stats.get('turret_slew',78))*(.4 if self.modules['ring']==1 else 1)
             desired=angle(V(target)-self.p)
-            if self.vehicle_id and self.stats['model'][2]=='casemate':desired=self.body+max(-10,min(10,diff(desired,self.body)))
+            if self.vehicle_id and (self.stats['model'][2]=='casemate' or self.stats.get('rocket_launcher')):
+                limit=self.stats.get('turret_limit',10);desired=self.body+max(-limit,min(limit,diff(desired,self.body)))
             previous=self.aim;self.aim=approach(self.aim,desired,rate*dt)
             if self.vehicle_id and terrain is not None and abs(diff(self.aim,previous))>.001 and not self.clear_at(self.p,self.body,terrain,tanks):self.aim=previous
     def damage_module(self,k,amount=1):
@@ -488,7 +561,9 @@ class Tank:
             ripple=pygame.Rect(0,0,82+int(g.time*15)%12,65+int(g.time*15)%10);ripple.center=q
             pygame.draw.ellipse(screen,(162,210,193),ripple,1)
         if self.vehicle_id:
-            draw_model(screen,self.stats,q,MODEL_SCALE,self.body,True,self.aim,(55,53,46) if wreck else self.stats['color'])
+            if g.vision!='thermal':
+                from BattleRendering import cached_vehicle
+                cached_vehicle(screen,self,q,MODEL_SCALE,(55,53,46) if wreck else self.stats['color'])
             if not self.modules['barrel']:pygame.draw.circle(screen,(175,56,37),q+direction(self.aim)*40,4)
             for side,key in ((-1,'left_track'),(1,'right_track')):
                 if not self.modules[key]:pygame.draw.line(screen,(165,57,40),q+V(-self.half_length,side*(self.half_width-3)).rotate(self.body),q+V(self.half_length,side*(self.half_width-3)).rotate(self.body),4)
@@ -538,7 +613,7 @@ class Game:
             self.enemy_country=max((c for c in NATIONS if c!=nation),key=lambda c:sum(VEHICLES[k]['branch']!=3 for k in battle_pool(VEHICLES,c,self.battle_br)))
         self.ai_ground_selector=GroundRoster(VEHICLES)
         self.terrain=Terrain(self.map_id);self.player=Tank(BASES[False],vehicle=(self.lineup[self.active_vehicle_slot] if self.lineup[self.active_vehicle_slot] in VEHICLES else f'{nation}_1_1') if self.lineup else None);self.enemies=[];self.allies=[];self.wrecks=[];self.bullets=[];self.fx=[];self.tracks=[]
-        self.vision="day";self.night_battle=False;self.scope_zoom=1.;self.mg_tracers=[];self.cam=V();self.scope=False;self.zoom=1.;self.scope_focus=V(self.player.p);self.fire_armed=True
+        self.vision="day";self.night_battle=__import__('Seasons').night();self.scope_zoom=1.;self.mg_tracers=[];self.cam=V();self.scope=False;self.zoom=1.;self.scope_focus=V(self.player.p);self.fire_armed=True
         self.wave=0;self.score=0;self.kills=0;self.wait=1.5;self.state='play';self.paused=False
         self.render_view=VIEW.copy();self.time=0;self.messages=[];self.hitview=None;self.xray=False;self.camera()
         self.enemy_queue=[];self.ground_kills=0;self.kill_goal=40
@@ -580,7 +655,7 @@ class Game:
         return False
     def visible(self,a,b,thermal=False,radar=False):return not self.terrain.blocks_shell(a,b) and (radar or not self.smoke_blocks(a,b,thermal))
     def add_smoke(self,p,kind):
-        self.smokes.append({'p':V(p),'kind':kind,'age':0.,'life':22. if kind=='grenade' else 12.,'radius':25.,'max_radius':110. if kind=='grenade' else 70.})
+        self.smokes.append({'p':V(p),'kind':kind,'age':0.,'life':28. if kind=='grenade' else 16.,'radius':45.,'max_radius':160. if kind=='grenade' else 110.})
         self.smokes=self.smokes[-160:]
     def deploy_smoke(self,t=None):
         t=t or self.player
@@ -601,7 +676,7 @@ class Game:
         t.ess_active=not t.ess_active;self.say('发动机烟幕 '+('开启' if t.ess_active else '关闭'));return True
     def update_smoke(self,dt):
         for cloud in self.smokes[:]:
-            cloud['age']+=dt;cloud['radius']=min(cloud['max_radius'],25+cloud['age']*55);cloud['p']+=V(3,-1)*dt
+            cloud['age']+=dt;cloud['radius']=min(cloud['max_radius'],45+cloud['age']*80);cloud['p']+=V(3,-1)*dt
             if cloud['age']>=cloud['life']:self.smokes.remove(cloud)
         for t in [self.player]+self.allies+self.enemies:
             if t.dead or not t.modules['engine']:t.ess_active=False
@@ -613,15 +688,10 @@ class Game:
             if self.vision=='thermal' and cloud['kind']=='ess':continue
             q=self.to_screen(cloud['p']);radius=int(cloud['radius'])
             if not self.render_view.inflate(radius*2,radius*2).collidepoint(q):continue
-            fade=min(1,cloud['age']/.5,max(0,(cloud['life']-cloud['age'])/4));alpha=int(210*fade)
-            image=pygame.Surface((radius*2+8,radius*2+8),pygame.SRCALPHA)
-            center=V(radius+4,radius+4)
-            for i in range(5):
-                p=center+direction(i*72+cloud['age']*9)*radius*.22
-                for ring in range(16,0,-1):
-                    opacity=int(alpha*(1-ring/17)**1.3)
-                    pygame.draw.circle(image,(184,189,181,opacity),p,max(1,int(radius*.73*ring/16)))
-            screen.blit(image,q-center)
+            from AIRedeployResponse import smoke_image
+            fade=min(1,cloud['age']/.25,max(0,(cloud['life']-cloud['age'])/4))
+            image=smoke_image(radius,cloud['kind']);image.set_alpha(int(255*fade))
+            screen.blit(image,q-V(image.get_width()/2,image.get_height()/2))
     def vehicles(self):return ([self.player] if not self.player.dead else [])+self.allies+self.enemies+self.wrecks
     def deployment_valid(self,p,enemy=False,vehicle=None):
         if vehicle:
@@ -759,13 +829,16 @@ class Game:
             parts=shot_ammo['type'].split('/');shot_ammo['effect_type']=parts[t.belt_cursor%len(parts)];t.belt_cursor+=1
         d=direction(t.aim+random.uniform(-spread,spread));self.bullets.append([t.muzzle(),d*((t.ammo.get("velocity") or 950)*.75 if t.ammo else 850),t.enemy,5.2,0.,t,{},0,t.ammo["penetration"][0] if t.ammo else t.stats["pen"],bool(t.vehicle_id and t.stats["branch"]==3 and isinstance(self.air.lock,dict)),shot_ammo])
         if t.stats.get('name') in ('BMPT','BMPT-72'):
-            shot=self.bullets[-1];side=direction(t.aim+90)*3.5;shot[0]-=side
-            other=list(shot);other[0]=shot[0]+side*2;other[1]=direction(t.aim+random.uniform(-spread,spread))*shot[1].length();other[6]={};other[10]=dict(shot_ammo) if shot_ammo else None
-            self.bullets.append(other)
+            self.bullets[-1][0]-=direction(t.aim+90)*(3.5*MODEL_SCALE)
         t.cd=t.stats["reload"]*(1.7 if t.ai or t.enemy else 1)
         if not t.modules['loader']:t.cd*=1.8
         elif t.modules['loader']==1:t.cd*=1.25
-        self.burst(t.muzzle(),(255,213,118),9);return True
+        if t.stats.get('rocket_launcher'):
+            side=-1 if getattr(t,'rocket_tube',0)%2==0 else 1;t.rocket_tube=getattr(t,'rocket_tube',0)+1
+            self.bullets[-1][0]+=direction(t.aim+90)*(side*3.5*MODEL_SCALE)
+        muzzles=[self.bullets[-1][0]]
+        for muzzle in muzzles:self.burst(muzzle,(255,213,118),9)
+        return True
     def machine_gun(self,t):
         if t.dead or not t.vehicle_id or not t.stats['mg'] or t.mg_cd>0 or not t.modules['gunner']:return False
         t.mg_cd=.105;offset=t.stats['model'][3];start=t.p+V((offset+20)*MODEL_SCALE,7*MODEL_SCALE).rotate(t.aim);end=start+direction(t.aim+random.uniform(-.8,.8))*950
@@ -805,9 +878,13 @@ class Game:
     def grenade_launcher(self,t=None):
         t=t or self.player;weapon=t.stats.get('grenade')
         if not weapon or t.dead or t.grenade_cd>0 or t.grenade_count<=0 or t.modules['gunner']<=0:return False
-        t.grenade_cd=max(.12,60/weapon.get('rpm',400));t.grenade_count-=1
-        ammo=dict(weapon['ammo'][0]);ammo['type']='HE';speed=ammo['velocity']*.75;heading=t.body
+        t.grenade_cd=max(.05 if weapon.get('type')=='cannon' else .12,60/weapon.get('rpm',400));t.grenade_count-=1
+        ammo=dict(weapon['ammo'][0]);cannon=weapon.get('type')=='cannon'
+        if not cannon:ammo['type']='HE'
+        elif '/' in ammo['type']:ammo['effect_type']=ammo['type'].split('/')[getattr(t,'secondary_belt_cursor',0)%len(ammo['type'].split('/'))];t.secondary_belt_cursor=getattr(t,'secondary_belt_cursor',0)+1
+        speed=ammo['velocity']*.75;heading=t.aim+random.uniform(-.6,.6) if cannon else t.body
         muzzle=t.p+direction(heading)*(t.half_length+8)
+        if cannon:muzzle+=direction(heading+90)*(17*MODEL_SCALE)
         self.bullets.append([muzzle,direction(heading)*speed,t.enemy,4.,0.,t,{},0,ammo['penetration'][0],False,ammo])
         return True
     def update_enemy_redeploy(self,dt):
@@ -877,6 +954,9 @@ class Game:
             aim_point=self.screen_to_world(pygame.mouse.get_pos())
             if p.vehicle_id and p.stats['branch']==3 and isinstance(self.air.lock,dict) and self.air.valid(self.air.lock,p):
                 target=self.air.lock;aim_point=target['p']+target['v']*(target['p'].distance_to(p.p)/850)
+            if p.stats.get('ground_ir_lock') and self.air.valid(self.air.lock,p) and not isinstance(self.air.lock,dict):
+                from T80M import lead
+                aim_point=lead(p,self.air.lock)
             p.aim_at(aim_point,dt,self.terrain,self.vehicles())
             left_held=self.controls.buttons("ground")[0]
             if not left_held:self.fire_armed=True
@@ -902,14 +982,10 @@ class Game:
         self.terrain.update(dt)
         for point in self.terrain.tree_events:self.burst(point,(118,150,73),12)
         self.terrain.tree_events.clear()
-        for t in [p]+self.allies+self.enemies:
-            if getattr(t,'airborne',False):continue
-            t.trail+=dt
-            if abs(t.speed)>8 and t.trail>.09:
-                t.trail=0
-                for side,k in ((-22,'left_track'),(22,'right_track')):
-                    if t.modules[k]:self.tracks.append((t.world((-15,side)),t.body))
-        self.tracks=self.tracks[-1800:]
+        from GroundTraces import emit as emit_traces
+        for t in [p]+self.allies+self.enemies:emit_traces(t,self.tracks,self.time,self.map_id=='urban_front')
+        from GroundTraces import prune
+        prune(self)
         for b in self.bullets[:]:
             if len(b)<6:b.append(None)
             if len(b)<7:b.append({})
@@ -921,7 +997,8 @@ class Game:
             hit=b[3]<=0 or not pygame.Rect(0,0,MW,MH).collidepoint(b[0])
             if not hit and self.air.shell_hit(old,b[0],b[5],b[10]):hit=True
             smoke_bullet=bool(b[10] and b[10]['type'].lower()=='smoke')
-            wallhit=not b[9] and self.terrain.blocks_shell(old,b[0])
+            from NewRewardVehicles import blocks as projectile_blocks
+            wallhit=not b[9] and projectile_blocks(self.terrain,old,b[0],b[10])
             if smoke_bullet and (wallhit or b[4]>=b[10].get('smoke_range',1000) or b[3]<=0):self.add_smoke(b[0],'grenade');hit=True
             if wallhit:
                 point=self.terrain.strike_tree(old,b[0],4)
@@ -1000,16 +1077,17 @@ class Game:
         if self.state=='deploy':self.draw_deployment();return
         world_view=pygame.Rect(0,VIEW.top,math.ceil(W/self.zoom),math.ceil(VIEW.h/self.zoom))
         display_screen=screen
-        screen=pygame.Surface((world_view.width,world_view.bottom))
+        size=(world_view.width,world_view.bottom)
+        if getattr(self,'world_buffer',None) is None or self.world_buffer.get_size()!=size:self.world_buffer=pygame.Surface(size)
+        screen=self.world_buffer
         self.render_view=world_view;self.air.screen=screen;self.air.view=world_view
         screen.set_clip(world_view);self.terrain.draw(self)
         self.objective.draw_world(screen,text,self.to_screen)
         for team,base in ((team,base) for team,bases in DEPLOY_BASES.items() for base in bases):
             q=self.to_screen(base);pygame.draw.circle(screen,(202,112,76) if team else (104,190,205),q,DEPLOY_RADIUS,2)
             text('敌方部署区' if team else '己方部署区',(q.x,q.y-DEPLOY_RADIUS+24),20,(232,173,129) if team else (155,225,237),True)
-        for p,a in self.tracks:
-            q=self.to_screen(p)
-            if self.render_view.collidepoint(q):pygame.draw.line(screen,(123,171,162) if self.terrain.in_shallow(p) else (52,61,36),q-direction(a)*5,q+direction(a)*5,4)
+        from GroundTraces import draw as draw_traces
+        draw_traces(self,screen,self.to_screen,self.render_view)
         for t in self.wrecks:t.draw(self,True)
         for t in self.enemies+self.allies+[self.player]:t.draw(self)
         for b in self.bullets:
@@ -1021,27 +1099,15 @@ class Game:
         if self.xray:
             for t in self.enemies+self.allies+[self.player]:
                 if self.to_screen(t.p).distance_to(V(W/2,H/2))<800:self.schematic(t,self.to_screen(t.p),1)
-        if self.vision in ('night','thermal'):
-            image=screen.subsurface(world_view).copy();pixels=pygame.surfarray.pixels3d(image)
-            gray=(pixels[:,:,0].astype('uint16')*3+pixels[:,:,1].astype('uint16')*6+pixels[:,:,2].astype('uint16'))//10
-            if self.vision=='night':
-                pixels[:,:,0]=gray//4;pixels[:,:,1]=gray.clip(25,220);pixels[:,:,2]=gray//5
-            else:
-                for channel in range(3):pixels[:,:,channel]=gray//2+20
-            del pixels;screen.blit(image,world_view.topleft)
-            if self.vision=='thermal':
-                for target in self.enemies+self.allies+[self.player]+self.wrecks:
-                    if target is not self.player and not self.visible(self.player.p,target.p,thermal=True):continue
-                    heat=(245,245,245) if not target.dead else (99,99,99)
-                    if target.vehicle_id:draw_model(screen,target.stats,self.to_screen(target.p),MODEL_SCALE,target.body,True,target.aim,heat)
-                    else:pygame.draw.rect(screen,heat,pygame.Rect(self.to_screen(target.p)-V(25,20),(50,40)),border_radius=8)
-        elif self.night_battle:
-            darkness=pygame.Surface(world_view.size,pygame.SRCALPHA);darkness.fill((1,5,15,185));screen.blit(darkness,world_view.topleft)
         self.draw_smoke()
         screen.set_clip(None)
-        world_image=screen.subsurface(world_view).copy()
+        world_image=screen.subsurface(world_view)
         screen=display_screen;self.air.screen=screen;self.air.view=VIEW
-        screen.blit(pygame.transform.scale(world_image,VIEW.size),VIEW.topleft)
+        if getattr(self,'display_buffer',None) is None or self.display_buffer.get_size()!=VIEW.size:self.display_buffer=pygame.Surface(VIEW.size)
+        pygame.transform.scale(world_image,VIEW.size,self.display_buffer)
+        screen.blit(self.display_buffer,VIEW.topleft)
+        from VisionRendering import apply
+        apply(self,screen,VIEW,MODEL_SCALE,draw_model)
         if self.player.vehicle_id and not getattr(self.player,'airborne',False):text(('夜间' if self.night_battle else '白昼')+' · '+{'day':'日间光学','night':'夜视仪','thermal':'白热热成像'}[self.vision]+f' · 视角 {self.zoom:.2f}× · '+self.controls.label('ground.mg')+' 机枪 / '+self.controls.label('ground.night')+' 夜视 / '+self.controls.label('ground.thermal')+' 热成像',(18,77),14,(211,224,184))
         self.air.hud()
         mouse=V(pygame.mouse.get_pos() if mouse_position is None else mouse_position)
@@ -1106,7 +1172,8 @@ class Game:
         screen.fill((15,24,21));r=self.deployment_map()
         text('选择部署点',(180,37),30,(176,225,204),True)
         text(self.map_name+' · 选择蓝色部署点，再点击“部署”；范围内随机生成。',(W/2,94),20,center=True)
-        pygame.draw.rect(screen,(64,78,47),r)
+        from Seasons import PALETTES,season
+        pygame.draw.rect(screen,PALETTES[season(self)][0],r)
         def pt(p):return V(r.x+p.x/MW*r.w,r.y+p.y/MH*r.h)
         for road in self.terrain.roads:pygame.draw.rect(screen,(123,107,73),(r.x+road.x/MW*r.w,r.y+road.y/MH*r.h,max(2,road.w/MW*r.w),max(2,road.h/MH*r.h)))
         for pond in self.terrain.ponds:
@@ -1184,8 +1251,28 @@ from LateJoin import install as install_late_join
 install_late_join(Game,Garage,globals())
 from AmmoBoxes import install as install_ammo_boxes
 install_ammo_boxes(Game,globals())
+from ReloadVoice import install as install_reload_voice
+install_reload_voice(Game)
+from MissileCamera import install as install_missile_camera
+install_missile_camera(Game,globals())
+from T80M import install as install_t80m
+install_t80m(Game,globals())
+from MissileRange import install as install_missile_range
+install_missile_range()
+from AIRedeployResponse import install as install_ai_response
+install_ai_response(Game,globals())
+from NewRewardVehicles import install as install_reward_weapons
+install_reward_weapons(Game,Tank,globals())
+from LiveDeployment import install as install_live_deployment
+install_live_deployment(Game)
+from AmmoLoadout import install as install_ammo_loadout
+install_ammo_loadout(Game,globals())
 
 def self_test():
+    from AIRedeployResponse import self_test as ai_response_checks
+    ai_response_checks(globals())
+    from ReloadVoiceChecks import run as reload_voice_checks
+    reload_voice_checks(globals())
     from AmmoBoxChecks import run as ammo_box_checks
     ammo_box_checks(globals())
     from LateJoinChecks import run as late_join_checks
@@ -1418,6 +1505,7 @@ def self_test():
     with tempfile.TemporaryDirectory() as testdir:
         profile=Profile(os.path.join(testdir,'profile.json'))
         assert not profile.equip('de_1_1') and not profile.unlock('cn_1_3')
+        profile.unlocked.add('cn_1_1')
         assert profile.unlock('cn_1_2') and profile.unlock('cn_1_3') and profile.research==120
         assert profile.equip('cn_1_3') and profile.selected=='cn_1_3'
         restored=Profile(profile.path);assert restored.selected==profile.selected and restored.research==120
@@ -1455,8 +1543,9 @@ def self_test():
     g.draw(V(940,330));pygame.image.save(screen,os.path.join(output_dir,'缩放预览.png'))
     with tempfile.TemporaryDirectory() as td:
         modern_profile=Profile(os.path.join(td,'modern.json'));modern_profile.select_country('us');modern_profile.research=20000
-        for tier in range(2,len(NATIONS['us']['branches'][1])+1):assert modern_profile.unlock(f'us_1_{tier}')
-        final_id=f'us_1_{len(NATIONS["us"]["branches"][1])}';assert VEHICLES[final_id]['name']=='M1A3'
+        for unit in sorted((d for d in VEHICLES.values() if d['country']=='us' and d['branch']==1 and not d.get('premium')),key=lambda d:d['tier']):
+            if unit['id'] not in modern_profile.unlocked:assert modern_profile.unlock(unit['id'])
+        final_id=next(k for k,d in VEHICLES.items() if d['country']=='us' and d['name']=='M1A3');assert VEHICLES[final_id]['name']=='M1A3'
         modern_profile.equip(final_id);modern=Game(True,'us',modern_profile.lineups['us'],0);modern.deploy_selected=True;assert modern.deploy_player(BASES[False])
         modern.terrain.obstacles=[];modern.terrain.ponds=[];modern.player.p=V(1800,1400);modern.player.aim=0;modern.allies=[];modern.enemies=[]
         modern.camera(.016,True,V(W/2,VIEW.centery));assert not modern.scope and modern.zoom==1.
@@ -1504,7 +1593,7 @@ def self_test():
             sample.body=sample.aim=rotation
             assert sample.shell_contact(sample.world((-100,0)),sample.world((100,0)))
     print('PASS: size-specific hulls, tracks/wheels, turret/barrel hits, 168 vehicles at four rotations, small/large obstacles and vehicle overlaps')
-    assert len(VEHICLES)==210 and all(len(n['branches'])==6 for n in NATIONS.values())
+    assert len(VEHICLES)==234 and all(len(n['branches'])==6 for n in NATIONS.values())
     aa=Game(True,'de',['de_3_8','de_3_5','de_0_9']);aa.deploy_selected=True;assert aa.deploy_player(BASES[False])
     aa.player.p=V(1800,1400);aa.player.aim=0;aa.terrain.obstacles=[];aa.allies=[];aa.enemies=[]
     aa.air.planes=[{'p':V(2450,1400),'v':V(-80,0),'dead':False,'health':3,'bomb':100,'life':30.}]
@@ -1519,7 +1608,7 @@ def self_test():
     print('PASS: six national branches, 168 vehicles, aircraft locking, guided missile interception, anti-aircraft cannon damage')
     print('PASS: barrel interception/probability, missed-barrel hull impact across frames, no repeated rolls, barrel/hull ricochet and reflected flight, rotated armor, random deployment, wheel zoom/right-button inactivity, allied AI, trees, driving, water, modules, win/lose, rendering')
     from VehicleData import DATA
-    assert len(DATA)==len(VEHICLES)==210
+    assert len(DATA)==len(VEHICLES)==234
     for ident,vehicle in VEHICLES.items():
         research=DATA[ident]
         assert all(field in research for field in ('weight','hp','forward','reverse','hull','turret'))
@@ -1543,7 +1632,7 @@ def self_test():
     assert smoke_game.deploy_smoke() and not smoke_game.deploy_smoke()
     smoke_game.smokes=[];smoke_game.add_smoke((1200,1000),'ess');smoke_game.update_smoke(2)
     assert not smoke_game.visible((1000,1000),(1400,1000)) and smoke_game.visible((1000,1000),(1400,1000),thermal=True)
-    assert sum(v['independent_missiles'] for v in VEHICLES.values())==23
+    assert sum(v['independent_missiles'] for v in VEHICLES.values())==26
     assert VEHICLES['ussr_0_1']['br']==1.0 and VEHICLES['ussr_1_5']['br']==8.7
     low_battle=Game(True,'ussr',['ussr_0_1']+[None]*7)
     low_battle.deploy_selected=True;assert low_battle.deploy_player(BASES[False])
@@ -1558,12 +1647,12 @@ def self_test():
     redeploy_test.update_enemy_redeploy(.11);assert len(redeploy_test.enemies)==TEAM_SIZE and not redeploy_test.enemy_queue
     bmpt_test=Game(True,'ussr',['ussr_2_11']+[None]*7);bmpt_test.deploy_selected=True
     assert bmpt_test.deploy_player(BASES[False]);assert bmpt_test.shoot(bmpt_test.player)
-    assert len(bmpt_test.bullets)==2 and bmpt_test.player.missile_count==4
+    assert len(bmpt_test.bullets)==1 and bmpt_test.player.missile_count==4
     assert bmpt_test.grenade_launcher() and bmpt_test.player.grenade_count==599
-    print('PASS: timed enemy redeployment, duplicate death guard, BMPT dual guns and independent grenade weapon')
+    print('PASS: timed enemy redeployment, duplicate death guard, BMPT single firing barrel and independent grenade weapon')
     aps_game=Game();aps_game.terrain.blocks_shell=lambda *a:False
     for country in ('cn','ussr','de','us'):
-        last=f"{country}_4_{len(NATIONS[country]['branches'][4])}"
+        last=max((k for k in VEHICLES if k.startswith(country+'_4_')),key=lambda k:int(k.split('_')[-1]))
         protected=Tank((1000,1000),vehicle=last);protected.body=protected.aim=0
         attacker=Tank((700,1000),True)
         aps_round={'name':'APS self-test','type':'ATGM','penetration':[600]*6,'velocity':500}
@@ -1607,7 +1696,49 @@ def main():
     screen=menu_screen
     W,H=screen.get_size();VIEW.update(0,68,W,H-110)
     battle_screen=pygame.Surface(pygame.display.get_surface().get_size()).convert()
-    if TEST:self_test();pygame.quit();return
+    if '--gpu-check' in sys.argv:
+        from NvidiaDisplay import native_check
+        native_check(globals());pygame.quit();return
+    if TEST:
+        from NvidiaDisplay import checks as overlay_checks
+        overlay_checks()
+        from ModelLayers import checks as layer_checks
+        layer_checks(globals())
+        from SeekerChecks import checks
+        checks(globals())
+        from MissileCamera import checks as missile_camera_checks
+        missile_camera_checks(globals())
+        from NewAircraft import checks as new_aircraft_checks
+        new_aircraft_checks(globals())
+        from T80M import checks as t80m_checks
+        t80m_checks(globals())
+        from ModernAirDefense import checks as aa_checks
+        aa_checks(globals())
+        from TechTreeLayout import checks as tree_checks
+        tree_checks(globals())
+        from NewRewardVehicles import checks as reward_checks
+        reward_checks(globals())
+        from BlastFragments import checks as blast_checks
+        blast_checks(globals())
+        from Changes42Checks import run as changes42_checks
+        changes42_checks(globals())
+        from GroundTraces import checks as trace_checks
+        trace_checks(globals())
+        from Changes132Checks import run as deployment_defense_checks
+        deployment_defense_checks(globals())
+        from AmmoLoadoutChecks import run as ammo_loadout_checks
+        ammo_loadout_checks(globals())
+        from SeasonChecks import run as season_checks
+        season_checks(globals())
+        from RenderOptimizationChecks import run as render_optimization_checks
+        render_optimization_checks(globals())
+        from BattlePerformanceChecks import run as battle_performance_checks
+        battle_performance_checks(globals())
+        from TechExpansion import checks as expansion_checks
+        expansion_checks(globals())
+        from RadarEchoChecks import checks as radar_echo_checks
+        from WarningThreatChecks import run as warning_threat_checks
+        warning_threat_checks();radar_echo_checks(globals());self_test();pygame.quit();return
     from InputBindings import get_controls
     controls=get_controls()
     from LANSquad import Room
@@ -1634,15 +1765,18 @@ def main():
         dt=min(clock.tick(60)/1000,.04)
         screen=menu_screen if menu else battle_screen
         W,H=screen.get_size();VIEW.update(0,68,W,H-110);WindowLayout.select(screen)
-        for ev in pygame.event.get():
+        for ev in pygame.event.get()+controls.poll_events('garage' if menu else (session.input_context() if session else g.input_context())):
             if ev.type==pygame.VIDEORESIZE:
-                pygame.display.set_mode((max(1280,ev.w),max(820,ev.h)),pygame.RESIZABLE)
+                from NvidiaDisplay import set_mode
+                set_mode((max(1280,ev.w),max(820,ev.h)))
                 battle_screen=pygame.Surface(pygame.display.get_surface().get_size()).convert()
                 menu_screen=pygame.Surface(battle_screen.get_size()).convert();garage.screen=menu_screen
                 presentation_button.y=menu_screen.get_height()-37
                 squad_button.y=588+garage.bottom_offset()
                 continue
             ev=window_event(ev)
+            from NvidiaDisplay import overlay_shortcut
+            if overlay_shortcut(ev):continue
             if ev.type==pygame.QUIT:running=False
             if ev.type==pygame.DROPFILE:
                 presentation.import_drop(ev.file);presentation.open=True;menu=True;continue
@@ -1669,8 +1803,14 @@ def main():
                 if session:session.issue('launcher_place',point=point)
                 else:g.battery.place(point)
                 continue
+            if not menu and not controls.open:
+                from AmmoLoadout import edit_event
+                if edit_event(g,ev):continue
             ev=controls.event(ev,'garage' if menu else (session.input_context() if session else g.input_context()),None if menu else g)
             if ev is None:continue
+            if not menu and ev.type==pygame.KEYDOWN and ev.key==pygame.K_F1:
+                from MissileCamera import toggle
+                toggle(g);continue
             if menu:
                 if ev.type==pygame.KEYDOWN:
                     if ev.key==pygame.K_RETURN:
@@ -1700,12 +1840,16 @@ def main():
                     elif ev.key==pygame.K_t and not g.flight.active:
                         from Reconnaissance import mark
                         mark(g,g.screen_to_world(pygame.mouse.get_pos()))
+                    elif ev.key==pygame.K_F6 and g.drone_active:
+                        from Reconnaissance import orbit
+                        orbit(g)
                     elif g.drone_active and ev.key not in (pygame.K_r,pygame.K_p):pass
                     elif g.flight.event(ev):
                         if ev.key in (pygame.K_m,pygame.K_n):garage.profile.aviation.weapons=g.flight.weapons;garage.profile.save()
                     elif ev.key==pygame.K_RETURN and g.state=='deploy':g.deploy_player(g.deploy_choice)
                     elif ev.key==pygame.K_r:garage.collect_game(g);g=battle()
                     elif ev.key==pygame.K_p and g.state in ('play','wreck'):g.paused=not g.paused
+                    elif pygame.K_1<=ev.key<=pygame.K_9 or ev.key==pygame.K_0:g.select_carried_ammo(9 if ev.key==pygame.K_0 else ev.key-pygame.K_1)
                     elif ev.key==pygame.K_b:
                         if g.switch_ammo():garage.profile.ammo_choices.update(g.ammo_choices);garage.profile.save()
                     elif ev.key==pygame.K_m:
@@ -1714,12 +1858,12 @@ def main():
                     elif ev.key==pygame.K_z:g.deploy_smoke()
                     elif ev.key==pygame.K_h:g.toggle_ess()
                     elif ev.key==pygame.K_F2:g.air.cycle_range()
+                    elif ev.key==pygame.K_BACKSPACE:g.air.lock=None;g.say('已取消雷达锁定')
                     elif ev.key==pygame.K_y:g.air.cycle_target()
                     elif ev.key==pygame.K_q:g.air.lock_target()
                     elif ev.key==pygame.K_j:g.air.launch()
                     elif ev.key==pygame.K_n:g.toggle_vision('night')
                     elif ev.key==pygame.K_v:g.toggle_vision('thermal')
-                    elif ev.key==pygame.K_l:g.night_battle=not g.night_battle
                     elif ev.key==pygame.K_x:g.xray=not g.xray
                     elif ev.key==pygame.K_e and not g.paused and g.state=='play':g.player.extinguish()
                 elif ev.type==pygame.MOUSEWHEEL:g.change_zoom(ev.y)
@@ -1748,6 +1892,8 @@ def main():
             if g.state in ('win','lose'):garage.collect_game(g)
         presentation.update(None if menu else g,dt)
         controls.draw(screen,text)
+        from FrameStats import draw as draw_frame_stats
+        draw_frame_stats(screen,clock)
         present_window(screen)
     if g:garage.collect_game(g)
     updater.close()
@@ -1755,5 +1901,8 @@ def main():
     if presentation.channel and pygame.mixer.get_init():presentation.channel.stop()
     room.close();game_input.restore();pygame.quit()
 if __name__=='__main__':main()
+
+
+
 
 
